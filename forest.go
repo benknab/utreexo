@@ -274,6 +274,10 @@ type Forest struct {
 	// materializes. Zero uses defaultAddRehashWindow.
 	addRehashWindow uint64
 
+	// proofReadWorkers bounds independent proof/position reads. Zero uses the
+	// platform default; one keeps all reads serial.
+	proofReadWorkers int
+
 	// positionMap maps leaf hashes to packed (addIndex, position) values.
 	// Upper 17 bits = addIndex (index within Modify batch), lower 47 bits = position.
 	// Only tracks leaves (row 0), not intermediate nodes.
@@ -449,6 +453,7 @@ type ForestOption func(*forestOptions)
 type forestOptions struct {
 	maxCacheMemory    int64
 	expectedMaxLeaves uint64
+	proofReadWorkers  int
 }
 
 // MaxCacheMemory sets the total WAL cache memory budget in bytes.
@@ -469,6 +474,16 @@ func ExpectedMaxLeaves(n uint64) ForestOption {
 	}
 }
 
+// ProofReadWorkers bounds parallel position lookups and proof ancestor reads.
+// Values 1 through 4 select the limit. Zero (the default) uses up to four
+// workers from GOMAXPROCS on Linux and serial reads elsewhere, where the
+// fallback cache's read lock can contend. Small proofs always stay serial.
+func ProofReadWorkers(n int) ForestOption {
+	return func(o *forestOptions) {
+		o.proofReadWorkers = n
+	}
+}
+
 // OpenForest opens a file-backed Forest at the given directory path,
 // creating it if it doesn't exist. It sets up a WAL with default cache
 // sizes and wires up the OnFlush callback for position map syncing.
@@ -479,6 +494,9 @@ func OpenForest(dbpath string, opts ...ForestOption) (*Forest, error) {
 	var o forestOptions
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if o.proofReadWorkers < 0 || o.proofReadWorkers > maxProofReadWorkers {
+		return nil, fmt.Errorf("proof read workers must be between 0 and %d", maxProofReadWorkers)
 	}
 
 	if err := os.MkdirAll(dbpath, 0700); err != nil {
@@ -583,6 +601,7 @@ func OpenForest(dbpath string, opts ...ForestOption) (*Forest, error) {
 
 	f.wal = wal
 	f.closers = closers
+	f.proofReadWorkers = o.proofReadWorkers
 
 	return f, nil
 }
@@ -1581,15 +1600,21 @@ func (f *Forest) lookupDeletions(delHashes []Hash) ([]uint64, error) {
 	// Reject unknown deletions before anything is written: a rejected block
 	// leaves the forest untouched, including its generated-leaves claim.
 	positions := make([]uint64, len(delHashes))
-	for i, delHash := range delHashes {
-		packed, found, err := f.positionMap.Get(delHash)
-		if err != nil {
-			return nil, fmt.Errorf("positionMap.Get: %w", err)
+	err := f.readProofRanges(len(delHashes), func(start, end int) error {
+		for i := start; i < end; i++ {
+			packed, found, err := f.positionMap.Get(delHashes[i])
+			if err != nil {
+				return fmt.Errorf("positionMap.Get: %w", err)
+			}
+			if !found {
+				return fmt.Errorf("delhash %v not found in position map", delHashes[i])
+			}
+			positions[i] = packed
 		}
-		if !found {
-			return nil, fmt.Errorf("delhash %v not found in position map", delHash)
-		}
-		positions[i] = packed
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return positions, nil
 }
@@ -2029,28 +2054,35 @@ func (f *Forest) prove(delHashes []Hash, positions []uint64) (Proof, error) {
 	// calculatePosition returns positions in f.forestRows space.
 	targets := make([]uint64, len(delHashes))
 	pairs := make([]targetPair, len(delHashes))
-	for i, hash := range delHashes {
-		var packed uint64
-		if positions != nil {
-			packed = positions[i]
-		} else {
-			var found bool
-			var err error
-			packed, found, err = f.positionMap.Get(hash)
+	err := f.readProofRanges(len(delHashes), func(start, end int) error {
+		for i := start; i < end; i++ {
+			hash := &delHashes[i]
+			var packed uint64
+			if positions != nil {
+				packed = positions[i]
+			} else {
+				var found bool
+				var err error
+				packed, found, err = f.positionMap.Get(*hash)
+				if err != nil {
+					return fmt.Errorf("positionMap.Get: %w", err)
+				}
+				if !found {
+					return fmt.Errorf("hash %v not found in the position map", *hash)
+				}
+			}
+			leafPos := unpackPos(packed)
+			target, err := f.calculatePositionFromLeaf(*hash, leafPos)
 			if err != nil {
-				return Proof{}, fmt.Errorf("positionMap.Get: %w", err)
+				return fmt.Errorf("find target for hash %x: %w", hash[:8], err)
 			}
-			if !found {
-				return Proof{}, fmt.Errorf("hash %v not found in the position map", hash)
-			}
+			targets[i] = target
+			pairs[i] = targetPair{calcPos: target, actualPos: leafPos}
 		}
-		leafPos := unpackPos(packed)
-		target, err := f.calculatePositionFromLeaf(hash, leafPos)
-		if err != nil {
-			return Proof{}, fmt.Errorf("find target for hash %x: %w", hash[:8], err)
-		}
-		targets[i] = target
-		pairs[i] = targetPair{calcPos: target, actualPos: leafPos}
+		return nil
+	})
+	if err != nil {
+		return Proof{}, err
 	}
 
 	// Translate from f.forestRows space to defaultForestRows space.

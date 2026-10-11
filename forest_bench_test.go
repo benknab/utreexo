@@ -63,6 +63,21 @@ func BenchmarkForestProve(b *testing.B) {
 	}
 }
 
+func BenchmarkForestProofReaders(b *testing.B) {
+	f, live := benchmarkProofForest(b)
+	for _, workers := range []int{1, 2, 4} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			f.proofReadWorkers = workers
+			b.ReportAllocs()
+			for range b.N {
+				if _, err := f.Prove(live[:5000]); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkForestModifyTTLsUndo(b *testing.B) {
 	f, live := benchmarkProofForest(b)
 	dels := live[:5000]
