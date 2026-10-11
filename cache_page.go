@@ -1,6 +1,9 @@
 package utreexo
 
-import "math/bits"
+import (
+	"math/bits"
+	"sync"
+)
 
 const (
 	cachePageSize = 4096 // 4KB per page, matches OS page size
@@ -34,6 +37,7 @@ func (pg *cachePage) setPresent(slot int) {
 // (e.g. 128 entries per page for 32-byte records) instead of one map
 // entry per cached record.
 type pageCacheStore struct {
+	mu           sync.RWMutex
 	pages        map[int64]*cachePage
 	entrySize_   int
 	slotsPerPage int
@@ -71,6 +75,7 @@ func (p *pageCacheStore) pageAndSlot(offset int64) (pageNum int64, slot int) {
 }
 
 // getPage returns the page for pageNum, allocating it if it doesn't exist.
+// The caller must hold mu for writing.
 func (p *pageCacheStore) getPage(pageNum int64) *cachePage {
 	pg := p.pages[pageNum]
 	if pg == nil {
@@ -85,6 +90,8 @@ func (p *pageCacheStore) getPage(pageNum int64) *cachePage {
 // get returns the cached entry at the given byte offset, or false if not present.
 // The returned slice aliases the page's internal storage.
 func (p *pageCacheStore) get(offset int64) ([]byte, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	pageNum, slot := p.pageAndSlot(offset)
 	pg := p.pages[pageNum]
 	if pg == nil || !pg.isPresent(slot) {
@@ -96,6 +103,8 @@ func (p *pageCacheStore) get(offset int64) ([]byte, bool) {
 
 // put writes data into the cache at the given byte offset, allocating a page if needed.
 func (p *pageCacheStore) put(offset int64, data []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	pageNum, slot := p.pageAndSlot(offset)
 	pg := p.getPage(pageNum)
 	start := slot * p.entrySize_
@@ -110,6 +119,8 @@ func (p *pageCacheStore) put(offset int64, data []byte) error {
 
 // clear removes all cached entries and frees all pages.
 func (p *pageCacheStore) clear() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	clear(p.pages)
 	p.totalCount = 0
 }
@@ -117,6 +128,8 @@ func (p *pageCacheStore) clear() {
 // forEach iterates over all occupied slots, calling fn with the byte offset and
 // data for each cached entry.
 func (p *pageCacheStore) forEach(fn func(offset int64, data []byte)) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	for pageNum, pg := range p.pages {
 		baseOffset := pageNum * cachePageSize
 		for w, word := range pg.present {
@@ -134,11 +147,15 @@ func (p *pageCacheStore) forEach(fn func(offset int64, data []byte)) {
 // overflowed returns true if the total number of cached entries exceeds the
 // configured maximum, signaling that a flush is needed.
 func (p *pageCacheStore) overflowed() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.totalCount > p.maxEntries
 }
 
 // count returns the total number of cached entries across all pages.
 func (p *pageCacheStore) count() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.totalCount
 }
 
