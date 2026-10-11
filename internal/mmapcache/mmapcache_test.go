@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 
@@ -267,6 +268,7 @@ func TestForEach(t *testing.T) {
 
 func TestOverflowed(t *testing.T) {
 	const entrySize = 8
+	pageSize := os.Getpagesize()
 
 	tests := []struct {
 		name     string
@@ -274,9 +276,10 @@ func TestOverflowed(t *testing.T) {
 		inserts  int
 		want     bool
 	}{
-		{name: "under limit", maxBytes: 24, inserts: 2, want: false},
-		{name: "at limit", maxBytes: 24, inserts: 3, want: false},
-		{name: "over limit", maxBytes: 24, inserts: 4, want: true},
+		{name: "empty", maxBytes: 1, inserts: 0, want: false},
+		{name: "under limit", maxBytes: int64(4 * pageSize), inserts: 2, want: false},
+		{name: "at limit", maxBytes: int64(3 * pageSize), inserts: pageSize / entrySize, want: false},
+		{name: "over limit", maxBytes: int64(3 * pageSize), inserts: pageSize/entrySize + 1, want: true},
 	}
 
 	for _, tt := range tests {

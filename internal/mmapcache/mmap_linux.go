@@ -8,7 +8,7 @@ import "syscall"
 // via mmap. The region is not backed by any file and lives outside the Go
 // heap, so the garbage collector does not scan it.
 func mmapAnon(size int) ([]byte, error) {
-	return syscall.Mmap(
+	data, err := syscall.Mmap(
 		-1, // fd: no backing file (required for MAP_ANONYMOUS)
 		0,  // offset: irrelevant without a backing file
 		size,
@@ -20,6 +20,16 @@ func mmapAnon(size int) ([]byte, error) {
 		//                  address space without requiring that much RAM or swap
 		syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_NORESERVE,
 	)
+	if err != nil {
+		return nil, err
+	}
+	// Sparse writes are budgeted in base pages. Transparent huge pages
+	// could otherwise allocate megabytes for a single small write.
+	if err := syscall.Madvise(data, syscall.MADV_NOHUGEPAGE); err != nil {
+		mmapRelease(data)
+		return nil, err
+	}
+	return data, nil
 }
 
 // mmapRelease unmaps a region previously allocated by mmapAnon.
@@ -32,9 +42,8 @@ func mmapRelease(data []byte) {
 // madviseDontNeed tells the kernel to drop the physical pages backing the
 // given range. The virtual mapping stays intact; subsequent accesses fault
 // in fresh zero-filled pages. Used by Store.Clear to release resident
-// memory after a logical reset without re-mmapping the address space.
-// Errors are ignored: MADV_DONTNEED is advisory and a failure only means
-// the kernel kept pages it was free to drop, which is benign.
-func madviseDontNeed(data []byte) {
-	_ = syscall.Madvise(data, syscall.MADV_DONTNEED)
+// memory after a logical reset without re-mmapping the address space. Return
+// errors so callers do not reset memory accounting for retained pages.
+func madviseDontNeed(data []byte) error {
+	return syscall.Madvise(data, syscall.MADV_DONTNEED)
 }

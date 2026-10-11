@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"os"
 	"sync/atomic"
 	"unsafe"
 )
@@ -49,8 +50,17 @@ type Store struct {
 	slots       int // total number of slots
 	words       int // number of uint64 words in the fine bitmap
 	coarseWords int // number of uint64 words in the coarse bitmap
-	maxEntries  int
 	totalCount  atomic.Int64
+
+	// Charge backing pages rather than payload bytes: a sparse 32-byte
+	// write can allocate a whole OS page. The coarse bitmap already records
+	// which 64-entry words are populated, so it also lets us count data-page
+	// groups without another map or per-entry bookkeeping.
+	maxBytes           int64
+	memoryBytes        atomic.Int64
+	wordsPerGroup      uint
+	bytesPerGroup      int64
+	metadataGroupBytes int64
 
 	// Atomic range of bitmap word indices. ForEach and Clear scan only
 	// [minWord, maxWord]. Initialized to empty (min > max).
@@ -100,8 +110,27 @@ func New(entrySize int, maxBytes int64) (*Store, error) {
 		slots:       slots,
 		words:       words,
 		coarseWords: coarseWords,
-		maxEntries:  int(maxBytes) / entrySize,
+		maxBytes:    maxBytes,
 	}
+	pageSize := int64(os.Getpagesize())
+	wordBytes := int64(bitsPerWord) * int64(entrySize)
+	s.wordsPerGroup = 1
+	s.bytesPerGroup = ((wordBytes+pageSize-1)/pageSize + 1) * pageSize
+	switch {
+	case pageSize%wordBytes == 0:
+		// A page can span more than one coarse word with small entries
+		// and large OS pages. Charge each coarse word separately in that
+		// case, conservatively overestimating rather than undercounting.
+		s.wordsPerGroup = uint(min(pageSize/wordBytes, bitsPerWord))
+		s.bytesPerGroup = pageSize
+	case wordBytes%pageSize == 0:
+		s.bytesPerGroup = wordBytes
+	}
+	// A coarse word covers 512 bytes of the fine bitmap plus its own
+	// eight bytes. Charge a page for each, even when neighboring coarse
+	// words share those pages. This small overestimate also avoids a
+	// second tracking bitmap and its own memory-accounting overhead.
+	s.metadataGroupBytes = 2 * pageSize
 	// Initialize range sentinels to "empty".
 	s.minWord.Store(math.MaxInt64)
 	s.maxWord.Store(-1)
@@ -233,6 +262,14 @@ func (s *Store) Put(offset int64, data []byte) error {
 						break
 					}
 					if atomic.CompareAndSwapUint64(coarsePtr, oldC, oldC|cmask) {
+						groupStart := uint(w%bitsPerWord) / s.wordsPerGroup * s.wordsPerGroup
+						groupMask := (^uint64(0) >> (bitsPerWord - s.wordsPerGroup)) << groupStart
+						if oldC&groupMask == 0 {
+							s.memoryBytes.Add(s.bytesPerGroup)
+						}
+						if oldC == 0 {
+							s.memoryBytes.Add(s.metadataGroupBytes)
+						}
 						break
 					}
 				}
@@ -243,12 +280,9 @@ func (s *Store) Put(offset int64, data []byte) error {
 }
 
 // Clear removes all entries and releases the physical pages backing the
-// data region. The virtual mmap regions remain allocated so the store
-// can be reused without re-mapping; the kernel returns fresh zero-filled
-// pages on next access to the data region. The bitmap regions are NOT
-// released because they are touched on every cache operation and dropping
-// them would just thrash the page tables. The data region, by contrast,
-// is accessed at scattered offsets and benefits from being released.
+// data and bitmap regions. The virtual mappings remain allocated so the
+// store can be reused without re-mapping. Releasing the bitmaps too bounds
+// their physical memory over repeated flushes with different write offsets.
 //
 // NOT safe for concurrent use with Get/Put.
 func (s *Store) Clear() {
@@ -279,7 +313,19 @@ func (s *Store) Clear() {
 	s.totalCount.Store(0)
 	s.minWord.Store(math.MaxInt64)
 	s.maxWord.Store(-1)
-	madviseDontNeed(s.data)
+	released := true
+	for _, region := range [][]byte{s.data, s.bitmap, s.bitmap2} {
+		if err := madviseDontNeed(region); err != nil {
+			released = false
+		}
+	}
+	if released {
+		s.memoryBytes.Store(0)
+	}
+	// If the kernel could not release a mapping, retain its charge. The
+	// explicit bitmap clearing above still makes the logical reset valid.
+	// Subsequent writes can overcount until a successful Clear, but cannot
+	// hide retained pages from the flush threshold.
 }
 
 // Close releases all mmap regions back to the OS.
@@ -297,6 +343,7 @@ func (s *Store) Close() {
 		s.bitmap2 = nil
 	}
 	s.totalCount.Store(0)
+	s.memoryBytes.Store(0)
 }
 
 // ForEach iterates over all cached entries, calling fn for each. Uses
@@ -319,8 +366,10 @@ func (s *Store) ForEach(fn func(offset int64, data []byte)) {
 	})
 }
 
-// Overflowed returns true if the cache has exceeded its memory budget.
-func (s *Store) Overflowed() bool { return int(s.totalCount.Load()) > s.maxEntries }
+// Overflowed reports whether the backing-page charge exceeds the memory
+// budget. Swapping pages out does not reduce the charge. This is a flush
+// threshold, not an allocation limit: callers check it between operations.
+func (s *Store) Overflowed() bool { return s.memoryBytes.Load() > s.maxBytes }
 
 // Count returns the total number of cached entries.
 func (s *Store) Count() int { return int(s.totalCount.Load()) }
