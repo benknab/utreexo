@@ -42,7 +42,8 @@ type pageCacheStore struct {
 	entrySize_   int
 	slotsPerPage int
 	wordsPerPage int // bitmap uint64 words needed per page
-	maxEntries   int
+	maxBytes     int64
+	pageBytes    int64 // backing data, bitmap, allocator and map allowance
 	totalCount   int
 }
 
@@ -60,7 +61,11 @@ func newPageCacheStore(entrySize int, maxBytes int64) *pageCacheStore {
 		entrySize_:   entrySize,
 		slotsPerPage: slotsPerPage,
 		wordsPerPage: wordsPerPage,
-		maxEntries:   int(maxBytes) / entrySize,
+		maxBytes:     maxBytes,
+		// A cachePage includes more than its 4096-byte data array and
+		// rounds up to a larger Go allocator class. Include a 1KB allowance
+		// for that object, plus bitmap storage and 64 bytes of map overhead.
+		pageBytes: int64(cachePageSize + 1024 + wordsPerPage*8 + 64),
 	}
 }
 
@@ -121,7 +126,8 @@ func (p *pageCacheStore) put(offset int64, data []byte) error {
 func (p *pageCacheStore) clear() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	clear(p.pages)
+	// Replacing the map releases its backing tables as well as the pages.
+	p.pages = make(map[int64]*cachePage)
 	p.totalCount = 0
 }
 
@@ -144,12 +150,12 @@ func (p *pageCacheStore) forEach(fn func(offset int64, data []byte)) {
 	}
 }
 
-// overflowed returns true if the total number of cached entries exceeds the
-// configured maximum, signaling that a flush is needed.
+// overflowed accounts for allocated pages rather than logical entry bytes.
+// A single sparse write retains a complete page until the cache is cleared.
 func (p *pageCacheStore) overflowed() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.totalCount > p.maxEntries
+	return len(p.pages) != 0 && 512+int64(len(p.pages))*p.pageBytes > p.maxBytes
 }
 
 // count returns the total number of cached entries across all pages.

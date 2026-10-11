@@ -168,7 +168,7 @@ func TestCacheStoreForEach(t *testing.T) {
 }
 
 func TestCacheStoreOverflowed(t *testing.T) {
-	// Use a tiny budget: 1KB with 32-byte entries = 32 entries max.
+	// A 1KB budget is smaller than a backing page.
 	for _, f := range cacheStoreFactories(t, 32, 1024) {
 		t.Run(f.name, func(t *testing.T) {
 			cs := f.cs
@@ -192,6 +192,40 @@ func TestCacheStoreOverflowed(t *testing.T) {
 				if !ok {
 					t.Fatalf("expected to find offset %d", i*32)
 				}
+			}
+		})
+	}
+}
+
+func TestCacheStoreSparseBudget(t *testing.T) {
+	for _, f := range cacheStoreFactories(t, 32, 1<<20) {
+		t.Run(f.name, func(t *testing.T) {
+			cs := f.cs
+			t.Cleanup(cs.close)
+			var data [32]byte
+			// One entry per 16KB also spans distinct OS pages on macOS.
+			for i := 0; i < 257; i++ {
+				if err := cs.put(int64(i)*16384, data[:]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !cs.overflowed() {
+				t.Fatal("sparse backing pages exceed 1MB despite a small payload")
+			}
+			cs.clear()
+			if cs.overflowed() || cs.count() != 0 {
+				t.Fatal("clear did not reset the cache budget")
+			}
+			// Dense writes and overwrites should share existing pages.
+			for pass := 0; pass < 2; pass++ {
+				for i := 0; i < 8192; i++ {
+					if err := cs.put(int64(i)*32, data[:]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if cs.overflowed() {
+				t.Fatal("dense 256KB payload should fit in 1MB")
 			}
 		})
 	}
