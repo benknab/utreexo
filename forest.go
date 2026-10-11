@@ -2,6 +2,7 @@ package utreexo
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -615,11 +616,31 @@ func (f *Forest) FlushNeeded() bool {
 // underlying file handles. bestHash is the consistency hash written
 // to the WAL during the final flush.
 func (f *Forest) Close(bestHash [32]byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var firstErr error
 	if f.wal != nil {
 		if err := f.wal.Flush(bestHash); err != nil {
 			firstErr = err
 		}
+	}
+	return errors.Join(firstErr, f.closeFiles())
+}
+
+// CloseWithoutFlush releases resources without committing cached mutations.
+// Use it after a failed operation that may have left a partially modified
+// in-memory state. The next OpenForest recovers the last committed WAL state;
+// a complete journal from a failed flush is retained and replayed normally.
+// Like Close, this invalidates the Forest for further use.
+func (f *Forest) CloseWithoutFlush() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closeFiles()
+}
+
+func (f *Forest) closeFiles() error {
+	var firstErr error
+	if f.wal != nil {
 		f.wal.Close()
 	}
 	if err := f.positionMap.Close(); err != nil && firstErr == nil {

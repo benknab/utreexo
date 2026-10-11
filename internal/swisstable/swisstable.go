@@ -67,6 +67,10 @@ type SwissPositionMap struct {
 	ctrlPath  string
 	slotsPath string
 
+	// dirty means the consistency headers were durably invalidated before
+	// modifying mmap data. Only a completed forest WAL flush may restamp them.
+	dirty bool
+
 	// Table sizing
 	numSlots  uint64
 	numGroups uint64 // numSlots / groupSize
@@ -287,6 +291,9 @@ type Batch struct {
 // BeginBatch pre-resizes the table to hold maxEntries additional inserts and
 // returns a Batch for inserting them. See Batch for the contract.
 func (m *SwissPositionMap) BeginBatch(maxEntries uint64) (Batch, error) {
+	if err := m.markDirty(); err != nil {
+		return Batch{}, err
+	}
 	for (m.count+maxEntries)*10 > m.numSlots*7 {
 		if err := m.resize(); err != nil {
 			return Batch{}, err
@@ -320,6 +327,9 @@ func (b *Batch) Insert(hash [32]byte, packed uint64) error {
 
 // Set stores a hash -> packed position mapping, resizing the table if needed.
 func (m *SwissPositionMap) Set(hash [32]byte, packed uint64) error {
+	if err := m.markDirty(); err != nil {
+		return err
+	}
 	// Resize before inserting if load factor would exceed 70%.
 	if (m.count+1)*10 > m.numSlots*7 {
 		if err := m.resize(); err != nil {
@@ -402,6 +412,9 @@ func (m *SwissPositionMap) Delete(hash [32]byte) (bool, error) {
 				return false, fmt.Errorf("swiss delete: %w", err)
 			}
 			if ok {
+				if err := m.markDirty(); err != nil {
+					return false, err
+				}
 				m.ctrl[slot] = ctrlDeleted
 				m.clearSlot(slot)
 				m.count--
@@ -456,6 +469,30 @@ func (m *SwissPositionMap) Close() error {
 	return errors.Join(errs...)
 }
 
+// markDirty invalidates the derived position index before any mmap mutation
+// can reach disk. Otherwise an uncommitted undo can remove entries while the
+// old consistency hash still claims that the index matches the saved forest.
+func (m *SwissPositionMap) markDirty() error {
+	if m.dirty {
+		return nil
+	}
+	var zero [fileHeaderSize]byte
+	if _, err := m.ctrlFile.WriteAt(zero[:], 0); err != nil {
+		return fmt.Errorf("invalidate ctrl hash: %w", err)
+	}
+	if _, err := m.slotsFile.WriteAt(zero[:], 0); err != nil {
+		return fmt.Errorf("invalidate slots hash: %w", err)
+	}
+	if err := m.ctrlFile.Sync(); err != nil {
+		return fmt.Errorf("sync invalid ctrl hash: %w", err)
+	}
+	if err := m.slotsFile.Sync(); err != nil {
+		return fmt.Errorf("sync invalid slots hash: %w", err)
+	}
+	m.dirty = true
+	return nil
+}
+
 // SetConsistencyHash updates the stored hash in the ctrl and slots file
 // headers and flushes the mmap to disk. Call this after WAL flush succeeds
 // to enable skipping rebuild on restart.
@@ -471,6 +508,9 @@ func (m *SwissPositionMap) SetConsistencyHash(hash [32]byte) error {
 	}
 	// Write through the fd (not the mmap) so that File.Sync is guaranteed
 	// to flush the header data.
+	// Even if publishing fails halfway, the next mutation must invalidate
+	// again rather than trusting the previous dirty flag.
+	m.dirty = false
 	if _, err := m.ctrlFile.WriteAt(hash[:], 0); err != nil {
 		return fmt.Errorf("write ctrl consistency hash: %w", err)
 	}

@@ -769,6 +769,48 @@ func BenchmarkMatchH2(b *testing.B) {
 	}
 }
 
+func TestMutationInvalidatesConsistency(t *testing.T) {
+	for _, mutation := range []string{"set", "batch", "delete"} {
+		t.Run(mutation, func(t *testing.T) {
+			path := t.TempDir()
+			data, err := os.Create(path + "/data")
+			require.NoError(t, err)
+			defer data.Close()
+			hash := testHashFromInt(1)
+			_, err = data.Write(hash[:])
+			require.NoError(t, err)
+			source := fileHashSource{data}
+			m, _, err := NewSwissPositionMap(path+"/ctrl", path+"/slots", 64, [32]byte{}, source, testPositionMask)
+			require.NoError(t, err)
+			require.NoError(t, m.Set(hash, 0))
+			tip := [32]byte{42}
+			require.NoError(t, m.SetConsistencyHash(tip))
+			require.NoError(t, m.Close())
+			m, rebuild, err := NewSwissPositionMap(path+"/ctrl", path+"/slots", 64, tip, source, testPositionMask)
+			require.NoError(t, err)
+			require.False(t, rebuild, "clean checkpoints should reuse the map")
+			switch mutation {
+			case "set":
+				require.NoError(t, m.Set(hash, 0))
+			case "batch":
+				batch, err := m.BeginBatch(1)
+				require.NoError(t, err)
+				require.NoError(t, batch.Insert(testHashFromInt(2), 1))
+			case "delete":
+				deleted, err := m.Delete(hash)
+				require.NoError(t, err)
+				require.True(t, deleted)
+			}
+			// Closing only the map cannot certify these uncommitted changes.
+			require.NoError(t, m.Close())
+			m, rebuild, err = NewSwissPositionMap(path+"/ctrl", path+"/slots", 64, tip, source, testPositionMask)
+			require.NoError(t, err)
+			defer m.Close()
+			require.True(t, rebuild)
+		})
+	}
+}
+
 func BenchmarkSwissGet(b *testing.B) {
 	tmpDir := b.TempDir()
 	dataPath := tmpDir + "/data"
