@@ -1653,11 +1653,16 @@ func (f *Forest) modifyInternal(adds []Leaf, delHashes []Hash, positions []uint6
 		}
 	}
 
-	// Then add.
-	for i, leaf := range adds {
-		if err := f.add(leaf.Hash, int32(i)); err != nil {
-			f.lastGeneratedLeaves = 0
-			return fmt.Errorf("add: %w", err)
+	// Warm bounded chunks before ordered mutation. Each read barrier completes
+	// while f.mu is held, so no reader can race Set or a table resize.
+	for start := 0; start < len(adds); start += 1024 {
+		end := min(start+1024, len(adds))
+		f.positionMap.Prefetch(end-start, func(i int) [32]byte { return adds[start+i].Hash })
+		for i := start; i < end; i++ {
+			if err := f.add(adds[i].Hash, int32(i)); err != nil {
+				f.lastGeneratedLeaves = 0
+				return fmt.Errorf("add: %w", err)
+			}
 		}
 	}
 
