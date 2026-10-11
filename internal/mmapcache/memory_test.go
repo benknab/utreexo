@@ -44,7 +44,7 @@ func TestDenseMemoryBudget(t *testing.T) {
 
 func TestConcurrentMemoryBudget(t *testing.T) {
 	pageSize := os.Getpagesize()
-	s := newTestStore(t, 32, int64(3*pageSize))
+	s := newTestStore(t, 32, int64(4*pageSize))
 	var wg sync.WaitGroup
 	for offset := 0; offset < pageSize; offset += 32 {
 		wg.Add(1)

@@ -127,3 +127,26 @@ func BenchmarkForestProveModifyUndo(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkForestBlockUpdateUndo(b *testing.B) {
+	f, live := benchmarkProofForest(b)
+	dels := live[:5000]
+	roots := f.GetRoots()
+	adds := make([]Leaf, 5000)
+	addHashes := make([]Hash, len(adds))
+	for i := range adds {
+		adds[i].Hash = testHashFromInt((1 << 18) + i + 1)
+		addHashes[i] = adds[i].Hash
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		proof, _, err := f.ProveAndModify(adds, dels, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := f.Undo(addHashes, proof, dels, roots); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

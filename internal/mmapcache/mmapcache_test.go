@@ -277,9 +277,9 @@ func TestOverflowed(t *testing.T) {
 		want     bool
 	}{
 		{name: "empty", maxBytes: 1, inserts: 0, want: false},
-		{name: "under limit", maxBytes: int64(4 * pageSize), inserts: 2, want: false},
-		{name: "at limit", maxBytes: int64(3 * pageSize), inserts: pageSize / entrySize, want: false},
-		{name: "over limit", maxBytes: int64(3 * pageSize), inserts: pageSize/entrySize + 1, want: true},
+		{name: "under limit", maxBytes: int64(5 * pageSize), inserts: 2, want: false},
+		{name: "at limit", maxBytes: int64(4 * pageSize), inserts: pageSize / entrySize, want: false},
+		{name: "over limit", maxBytes: int64(4 * pageSize), inserts: pageSize/entrySize + 1, want: true},
 	}
 
 	for _, tt := range tests {

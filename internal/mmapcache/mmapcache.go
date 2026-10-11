@@ -4,8 +4,8 @@
 // The region covers the full data file address space but pages are
 // demand-paged by the kernel, so only touched pages consume physical memory.
 // A bitmap tracks which slots have cached data. A second-level (coarse)
-// bitmap with one bit per 64 fine words lets ForEach and Clear skip large
-// empty regions cheaply. Atomic range tracking [minWord, maxWord]
+// bitmap with one bit per 64 fine words and a third summary level let
+// ForEach and Clear skip large empty regions cheaply. Atomic range tracking
 // further bounds the scan without any mutex or dense list, making Put fully
 // lock-free.
 package mmapcache
@@ -45,6 +45,7 @@ type Store struct {
 	data    []byte // mmap'd data region (demand-paged)
 	bitmap  []byte // mmap'd bitmap; tracks which slots have cached data
 	bitmap2 []byte // mmap'd coarse bitmap; bit cw*64+cb means bitmap word cw*64+cb may be non-zero
+	bitmap3 []byte // summary of non-empty coarse words; skips sparse row-layout gaps
 
 	entrySize   int
 	slots       int // total number of slots
@@ -101,11 +102,19 @@ func New(entrySize int, maxBytes int64) (*Store, error) {
 		mmapRelease(bitmap)
 		return nil, fmt.Errorf("mmapcache: mmap bitmap2 %d bytes: %w", coarseBitmapSize, err)
 	}
+	bitmap3, err := mmapAnon(max(8, ((coarseWords+bitsPerWord-1)/bitsPerWord)*8))
+	if err != nil {
+		mmapRelease(data)
+		mmapRelease(bitmap)
+		mmapRelease(bitmap2)
+		return nil, fmt.Errorf("mmapcache: mmap bitmap3: %w", err)
+	}
 
 	s := &Store{
 		data:        data,
 		bitmap:      bitmap,
 		bitmap2:     bitmap2,
+		bitmap3:     bitmap3,
 		entrySize:   entrySize,
 		slots:       slots,
 		words:       words,
@@ -180,20 +189,28 @@ func atomicMaxInt64(addr *atomic.Int64, val int64) {
 //
 // NOT safe for concurrent use with Put.
 func (s *Store) forEachWord(fn func(w int64)) {
+	s.forEachCoarseWord(func(cw int64) {
+		cword := atomic.LoadUint64(bmWordPtr(s.bitmap2, cw))
+		for cword != 0 {
+			cbit := bits.TrailingZeros64(cword)
+			cword &= cword - 1
+			fn(cw*bitsPerWord + int64(cbit))
+		}
+	})
+}
+
+func (s *Store) forEachCoarseWord(fn func(cw int64)) {
 	lo := s.minWord.Load()
 	hi := s.maxWord.Load()
 	if lo > hi {
 		return
 	}
-	coarseLo := lo / bitsPerWord
-	coarseHi := hi / bitsPerWord
-	for cw := coarseLo; cw <= coarseHi; cw++ {
-		cword := atomic.LoadUint64(bmWordPtr(s.bitmap2, cw))
-		for cword != 0 {
-			cbit := bits.TrailingZeros64(cword)
-			cword &= cword - 1
-			w := cw*bitsPerWord + int64(cbit)
-			fn(w)
+	for tw := lo / (bitsPerWord * bitsPerWord); tw <= hi/(bitsPerWord*bitsPerWord); tw++ {
+		word := atomic.LoadUint64(bmWordPtr(s.bitmap3, tw))
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			word &= word - 1
+			fn(tw*bitsPerWord + int64(bit))
 		}
 	}
 }
@@ -269,6 +286,11 @@ func (s *Store) Put(offset int64, data []byte) error {
 						}
 						if oldC == 0 {
 							s.memoryBytes.Add(s.metadataGroupBytes)
+							top := bmWordPtr(s.bitmap3, cw/bitsPerWord)
+							if atomic.OrUint64(top, uint64(1)<<uint(cw%bitsPerWord)) == 0 {
+								// Conservatively charge a summary page per word.
+								s.memoryBytes.Add(s.metadataGroupBytes / 2)
+							}
 						}
 						break
 					}
@@ -294,13 +316,8 @@ func (s *Store) Clear() {
 	lo := s.minWord.Load()
 	hi := s.maxWord.Load()
 	if lo <= hi {
-		coarseLo := lo / bitsPerWord
-		coarseHi := hi / bitsPerWord
-		for cw := coarseLo; cw <= coarseHi; cw++ {
+		s.forEachCoarseWord(func(cw int64) {
 			cword := atomic.LoadUint64(bmWordPtr(s.bitmap2, cw))
-			if cword == 0 {
-				continue
-			}
 			for cword != 0 {
 				cbit := bits.TrailingZeros64(cword)
 				cword &= cword - 1
@@ -308,13 +325,16 @@ func (s *Store) Clear() {
 				atomic.StoreUint64(bmWordPtr(s.bitmap, w), 0)
 			}
 			atomic.StoreUint64(bmWordPtr(s.bitmap2, cw), 0)
+		})
+		for tw := lo / (bitsPerWord * bitsPerWord); tw <= hi/(bitsPerWord*bitsPerWord); tw++ {
+			atomic.StoreUint64(bmWordPtr(s.bitmap3, tw), 0)
 		}
 	}
 	s.totalCount.Store(0)
 	s.minWord.Store(math.MaxInt64)
 	s.maxWord.Store(-1)
 	released := true
-	for _, region := range [][]byte{s.data, s.bitmap, s.bitmap2} {
+	for _, region := range [][]byte{s.data, s.bitmap, s.bitmap2, s.bitmap3} {
 		if err := madviseDontNeed(region); err != nil {
 			released = false
 		}
@@ -342,12 +362,16 @@ func (s *Store) Close() {
 		mmapRelease(s.bitmap2)
 		s.bitmap2 = nil
 	}
+	if s.bitmap3 != nil {
+		mmapRelease(s.bitmap3)
+		s.bitmap3 = nil
+	}
 	s.totalCount.Store(0)
 	s.memoryBytes.Store(0)
 }
 
 // ForEach iterates over all cached entries, calling fn for each. Uses
-// the two-level bitmap so empty 4096-slot regions are skipped without
+// the summary bitmaps so empty 262144-slot regions are skipped without
 // inspecting their fine words.
 //
 // NOT safe for concurrent use with Put.
