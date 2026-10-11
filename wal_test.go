@@ -11,6 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type journalEntry struct {
+	fileIdx uint8
+	offset  int64
+	data    []byte
+}
+
 // serializeEntries encodes journal entries into a byte slice (test helper).
 func serializeEntries(entries []journalEntry) []byte {
 	size := 0
@@ -26,6 +32,23 @@ func serializeEntries(entries []journalEntry) []byte {
 		buf = append(buf, e.data...)
 	}
 	return buf
+}
+
+// serializeEntries retains the original journal encoder as a compatibility
+// oracle and for constructing crash-recovery fixtures.
+func (w *wal) serializeEntries(bestHash [32]byte) []byte {
+	var entries []journalEntry
+	for i, c := range w.cached {
+		c.cache.forEach(func(offset int64, data []byte) {
+			entries = append(entries, journalEntry{uint8(i), offset, data})
+		})
+	}
+	w.bitmap.forEachDirty(func(offset int64, data []byte) {
+		// Bitmap iteration reuses a temporary serialization buffer.
+		entries = append(entries, journalEntry{deletedFileIdx, offset, append([]byte(nil), data...)})
+	})
+	entries = append(entries, journalEntry{metaFileIdx, bestHashOffset, bestHash[:]})
+	return serializeEntries(entries)
 }
 
 // crashAfterCommit simulates a crash that occurs after the journal has

@@ -1,7 +1,9 @@
 package utreexo
 
 import (
+	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -38,7 +40,7 @@ import (
 //	3 = deleted bitmap file (dirty words from deletedBitmap)
 //
 // Flush sequence:
-//  1. Collect entries from cachedRWS caches + dirty bitmap words
+//  1. Stream entries from cachedRWS caches + dirty bitmap words
 //  2. Add consistency hash entry (file 2, offset 64)
 //  3. Write bestHash + entries + CRC32 checksum to journal
 //  4. Sync journal
@@ -62,19 +64,13 @@ type wal struct {
 	onFlush    func([32]byte) error
 }
 
-// journalEntry represents a single write operation in the WAL journal.
-type journalEntry struct {
-	fileIdx uint8
-	offset  int64
-	data    []byte
-}
-
 const (
 	journalHeaderSize   = 8  // uint64 totalLen
 	journalHashSize     = 32 // [32]byte bestHash
 	journalChecksumSize = 4  // uint32 CRC32
 	entryHeaderSize     = 13 // 1 (fileIdx) + 8 (offset) + 4 (dataLen)
 	journalMinSize      = journalHeaderSize + journalHashSize + journalChecksumSize
+	journalBufferSize   = 64 << 10
 
 	metaFileIdx    = 2  // journal fileIdx for the metadata file
 	deletedFileIdx = 3  // journal fileIdx for the deleted bitmap file
@@ -178,37 +174,8 @@ func (w *wal) Close() {
 // Flush atomically commits all cached writes through the journal.
 // The bestHash is written to metaFile (file index 2) at offset 64.
 func (w *wal) Flush(bestHash [32]byte) error {
-	// Serialize entries directly from caches to avoid intermediate allocations.
-	entriesBuf := w.serializeEntries(bestHash)
-	totalLen := uint64(len(entriesBuf))
-
-	// Build header.
-	var header [journalHeaderSize]byte
-	binary.LittleEndian.PutUint64(header[:], totalLen)
-
-	// Compute CRC32 over header + bestHash + entries.
-	crc := crc32.NewIEEE()
-	crc.Write(header[:])
-	crc.Write(bestHash[:])
-	crc.Write(entriesBuf)
-	var checksumBuf [journalChecksumSize]byte
-	binary.LittleEndian.PutUint32(checksumBuf[:], crc.Sum32())
-
-	// Write journal: header + bestHash + entries + checksum.
-	if _, err := w.journal.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("wal journal seek: %w", err)
-	}
-	if _, err := w.journal.Write(header[:]); err != nil {
-		return fmt.Errorf("wal journal write header: %w", err)
-	}
-	if _, err := w.journal.Write(bestHash[:]); err != nil {
-		return fmt.Errorf("wal journal write bestHash: %w", err)
-	}
-	if _, err := w.journal.Write(entriesBuf); err != nil {
-		return fmt.Errorf("wal journal write entries: %w", err)
-	}
-	if _, err := w.journal.Write(checksumBuf[:]); err != nil {
-		return fmt.Errorf("wal journal write checksum: %w", err)
+	if err := w.writeJournal(bestHash); err != nil {
+		return err
 	}
 
 	// Sync journal to ensure it's durable before touching underlying files.
@@ -261,47 +228,69 @@ func (w *wal) Flush(bestHash [32]byte) error {
 	return nil
 }
 
-// serializeEntries encodes journal entries directly from caches and the
-// dirty bitmap into a byte slice. Includes the bestHash entry for metaFile.
-func (w *wal) serializeEntries(bestHash [32]byte) []byte {
-	// Pre-calculate total size.
-	size := 0
+// writeJournal preserves the journal format while using a fixed-size buffer.
+// The checksum covers bytes as they are written; the journal must still be
+// synced by the caller before applying any changes to the underlying files.
+func (w *wal) writeJournal(bestHash [32]byte) error {
+	size := uint64(entryHeaderSize + journalHashSize)
 	for _, c := range w.cached {
-		size += c.cache.count() * (entryHeaderSize + c.cache.entrySize())
+		size += uint64(c.cache.count()) * uint64(entryHeaderSize+c.cache.entrySize())
 	}
-	// Add dirty bitmap entries.
-	size += len(w.bitmap.dirtyWords) * (entryHeaderSize + 8)
-	// Add bestHash entry for metaFile.
-	size += entryHeaderSize + 32
+	size += uint64(len(w.bitmap.dirtyWords)) * (entryHeaderSize + 8)
+	if _, err := w.journal.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("wal journal seek: %w", err)
+	}
+	crc := crc32.NewIEEE()
+	buf := bufio.NewWriterSize(io.MultiWriter(w.journal, crc), journalBufferSize)
+	var header [journalHeaderSize]byte
+	binary.LittleEndian.PutUint64(header[:], size)
+	if _, err := buf.Write(header[:]); err != nil {
+		return fmt.Errorf("wal journal write header: %w", err)
+	}
+	if _, err := buf.Write(bestHash[:]); err != nil {
+		return fmt.Errorf("wal journal write bestHash: %w", err)
+	}
 
-	buf := make([]byte, 0, size)
+	var entryHeader [entryHeaderSize]byte
+	var writeErr error
+	writeEntry := func(fileIdx uint8, offset int64, data []byte) {
+		if writeErr != nil {
+			return
+		}
+		entryHeader[0] = fileIdx
+		binary.LittleEndian.PutUint64(entryHeader[1:9], uint64(offset))
+		binary.LittleEndian.PutUint32(entryHeader[9:], uint32(len(data)))
+		if _, writeErr = buf.Write(entryHeader[:]); writeErr == nil {
+			_, writeErr = buf.Write(data)
+		}
+	}
 
-	// Serialize entries from each cache.
 	for i, c := range w.cached {
-		fileIdx := uint8(i)
 		c.cache.forEach(func(offset int64, data []byte) {
-			buf = append(buf, fileIdx)
-			buf = binary.LittleEndian.AppendUint64(buf, uint64(offset))
-			buf = binary.LittleEndian.AppendUint32(buf, uint32(len(data)))
-			buf = append(buf, data...)
+			writeEntry(uint8(i), offset, data)
 		})
 	}
-
-	// Serialize dirty bitmap words.
 	w.bitmap.forEachDirty(func(offset int64, data []byte) {
-		buf = append(buf, deletedFileIdx)
-		buf = binary.LittleEndian.AppendUint64(buf, uint64(offset))
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(data)))
-		buf = append(buf, data...)
+		writeEntry(deletedFileIdx, offset, data)
 	})
+	writeEntry(metaFileIdx, bestHashOffset, bestHash[:])
+	if writeErr != nil {
+		return fmt.Errorf("wal journal write entries: %w", writeErr)
+	}
+	if err := buf.Flush(); err != nil {
+		return fmt.Errorf("wal journal flush buffer: %w", err)
+	}
 
-	// Add bestHash entry for metaFile.
-	buf = append(buf, metaFileIdx)
-	buf = binary.LittleEndian.AppendUint64(buf, bestHashOffset)
-	buf = binary.LittleEndian.AppendUint32(buf, 32)
-	buf = append(buf, bestHash[:]...)
-
-	return buf
+	var checksum [journalChecksumSize]byte
+	binary.LittleEndian.PutUint32(checksum[:], crc.Sum32())
+	n, err := w.journal.Write(checksum[:])
+	if err != nil {
+		return fmt.Errorf("wal journal write checksum: %w", err)
+	}
+	if n != len(checksum) {
+		return fmt.Errorf("wal journal write checksum: %w", io.ErrShortWrite)
+	}
+	return nil
 }
 
 // applyFromCaches writes cached entries and dirty bitmap words directly to
@@ -379,43 +368,45 @@ func (w *wal) FlushNeeded() bool {
 	return w.cached[0].FlushNeeded()
 }
 
-// parseEntries decodes journal entries from a byte slice.
-func parseEntries(buf []byte) ([]journalEntry, error) {
-	var entries []journalEntry
-	for len(buf) >= entryHeaderSize {
-		fileIdx := buf[0]
-		offset := int64(binary.LittleEndian.Uint64(buf[1:9]))
-		dataLen := binary.LittleEndian.Uint32(buf[9:entryHeaderSize])
-		buf = buf[entryHeaderSize:]
+var errInvalidJournal = errors.New("invalid journal entry")
 
-		if uint32(len(buf)) < dataLen {
-			return nil, fmt.Errorf("wal: truncated entry data: need %d, have %d", dataLen, len(buf))
+// readJournalEntries validates the entry framing and optionally applies the
+// writes. Both passes use bounded memory, including for large entry payloads
+// in journals written by older versions.
+func readJournalEntries(r io.Reader, remaining uint64, underlying []forestFile, apply bool) error {
+	var header [entryHeaderSize]byte
+	var data [journalBufferSize]byte
+	for remaining > 0 {
+		if remaining < entryHeaderSize {
+			return fmt.Errorf("%w: trailing bytes", errInvalidJournal)
 		}
-
-		data := make([]byte, dataLen)
-		copy(data, buf[:dataLen])
-		buf = buf[dataLen:]
-
-		entries = append(entries, journalEntry{
-			fileIdx: fileIdx,
-			offset:  offset,
-			data:    data,
-		})
-	}
-	if len(buf) != 0 {
-		return nil, fmt.Errorf("wal: %d trailing bytes after last entry", len(buf))
-	}
-	return entries, nil
-}
-
-// applyEntries writes each entry to the appropriate underlying file.
-func applyEntries(entries []journalEntry, underlying []forestFile) error {
-	for _, e := range entries {
-		if int(e.fileIdx) >= len(underlying) {
-			return fmt.Errorf("wal: fileIdx %d out of range (have %d files)", e.fileIdx, len(underlying))
-		}
-		if _, err := underlying[e.fileIdx].WriteAt(e.data, e.offset); err != nil {
+		if _, err := io.ReadFull(r, header[:]); err != nil {
 			return err
+		}
+		remaining -= entryHeaderSize
+		fileIdx := int(header[0])
+		offset := binary.LittleEndian.Uint64(header[1:9])
+		dataLen := uint64(binary.LittleEndian.Uint32(header[9:]))
+		if fileIdx >= len(underlying) || offset > uint64(1<<63-1)-dataLen || dataLen > remaining {
+			return fmt.Errorf("%w: file %d, offset %d, length %d", errInvalidJournal, fileIdx, offset, dataLen)
+		}
+		remaining -= dataLen
+		for dataLen > 0 {
+			chunk := data[:min(dataLen, uint64(len(data)))]
+			if _, err := io.ReadFull(r, chunk); err != nil {
+				return err
+			}
+			if apply {
+				n, err := underlying[fileIdx].WriteAt(chunk, int64(offset))
+				if err != nil {
+					return err
+				}
+				if n != len(chunk) {
+					return io.ErrShortWrite
+				}
+			}
+			offset += uint64(len(chunk))
+			dataLen -= uint64(len(chunk))
 		}
 	}
 	return nil
@@ -428,8 +419,12 @@ func (w *wal) clearJournal() error {
 		return err
 	}
 	var zero [journalHeaderSize]byte
-	if _, err := w.journal.Write(zero[:]); err != nil {
+	n, err := w.journal.Write(zero[:])
+	if err != nil {
 		return err
+	}
+	if n != len(zero) {
+		return io.ErrShortWrite
 	}
 	// Truncate to reclaim disk space if the file supports it.
 	if truncater, ok := w.journal.(interface{ Truncate(size int64) error }); ok {
@@ -457,10 +452,12 @@ func (w *wal) recoverFromJournal(underlying []forestFile) error {
 	if _, err := w.journal.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	var totalLen uint64
-	if err := binary.Read(w.journal, binary.LittleEndian, &totalLen); err != nil {
-		return nil // Can't read header, nothing to recover.
+	r := bufio.NewReaderSize(w.journal, journalBufferSize)
+	var header [journalHeaderSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return err
 	}
+	totalLen := binary.LittleEndian.Uint64(header[:])
 
 	if totalLen == 0 {
 		return nil // No pending transaction.
@@ -470,55 +467,42 @@ func (w *wal) recoverFromJournal(underlying []forestFile) error {
 	if totalLen > uint64(size)-journalMinSize {
 		return w.clearJournal()
 	}
-	if totalLen > ^uint64(0)>>1 { // max int64
-		return w.clearJournal()
-	}
-
-	// Check if the full record fits in the file.
-	recordSize := int64(journalHeaderSize) + int64(journalHashSize) + int64(totalLen) + int64(journalChecksumSize)
-	if recordSize > size {
-		// Incomplete write; underlying files have the old consistent state.
-		return w.clearJournal()
-	}
-
 	// Read bestHash.
 	var bestHash [journalHashSize]byte
-	if _, err := io.ReadFull(w.journal, bestHash[:]); err != nil {
-		return w.clearJournal()
+	if _, err := io.ReadFull(r, bestHash[:]); err != nil {
+		return err
 	}
 
-	// Read entries.
-	entriesBuf := make([]byte, totalLen)
-	if _, err := io.ReadFull(w.journal, entriesBuf); err != nil {
-		return w.clearJournal()
+	// Verify the entire record before changing any underlying file. Read
+	// errors leave the journal intact so recovery can be retried.
+	crc := crc32.NewIEEE()
+	crc.Write(header[:])
+	crc.Write(bestHash[:])
+	if err := readJournalEntries(io.TeeReader(r, crc), totalLen, underlying, false); err != nil {
+		if errors.Is(err, errInvalidJournal) {
+			return w.clearJournal()
+		}
+		return err
 	}
 
 	// Read stored checksum.
 	var storedChecksum uint32
-	if err := binary.Read(w.journal, binary.LittleEndian, &storedChecksum); err != nil {
-		return w.clearJournal()
+	if err := binary.Read(r, binary.LittleEndian, &storedChecksum); err != nil {
+		return err
 	}
-
-	// Verify CRC32 over header + bestHash + entries.
-	crc := crc32.NewIEEE()
-	var header [journalHeaderSize]byte
-	binary.LittleEndian.PutUint64(header[:], totalLen)
-	crc.Write(header[:])
-	crc.Write(bestHash[:])
-	crc.Write(entriesBuf)
 
 	if crc.Sum32() != storedChecksum {
 		// Corrupt journal; discard.
 		return w.clearJournal()
 	}
 
-	// Parse and replay entries.
-	entries, err := parseEntries(entriesBuf)
-	if err != nil {
-		return w.clearJournal()
+	// Replay in a second streaming pass. On failure keep the committed
+	// journal: these offset writes are idempotent on the next recovery.
+	if _, err := w.journal.Seek(journalHeaderSize+journalHashSize, io.SeekStart); err != nil {
+		return err
 	}
-
-	if err := applyEntries(entries, underlying); err != nil {
+	r.Reset(w.journal)
+	if err := readJournalEntries(r, totalLen, underlying, true); err != nil {
 		return err
 	}
 
