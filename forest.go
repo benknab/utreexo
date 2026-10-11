@@ -909,15 +909,15 @@ func (f *Forest) posToFileOffset(position uint64) int64 {
 	return rowBaseOffset(row, f.forestRows) + int64(position-rowStart)*32
 }
 
-// readHash reads the hash at the given position from the file using ReadAt.
+// readHash reads the hash at the given position by value, avoiding a heap
+// allocation for every read through the underlying file interface.
 // Positions that have never been written (read past EOF) yield a zero Hash,
 // matching the forest's "unwritten = empty" semantics.
 // Safe for concurrent use with other readHash/writeHash calls on disjoint
 // positions (no shared seek position).
 func (f *Forest) readHash(position uint64) (Hash, error) {
 	offset := f.posToFileOffset(position)
-	var hash Hash
-	_, err := f.file.ReadAt(hash[:], offset)
+	hash, err := f.file.HashAt(offset)
 	if err == io.EOF {
 		return Hash{}, nil
 	}
