@@ -82,3 +82,33 @@ func BenchmarkForestModifyTTLsUndo(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkForestProveModifyUndo(b *testing.B) {
+	for _, combined := range []bool{false, true} {
+		b.Run(fmt.Sprintf("combined=%t", combined), func(b *testing.B) {
+			f, live := benchmarkProofForest(b)
+			dels := live[:5000]
+			roots := f.GetRoots()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				var proof Proof
+				var err error
+				if combined {
+					proof, _, err = f.ProveAndModify(nil, dels, nil)
+				} else {
+					proof, err = f.Prove(dels)
+					if err == nil {
+						_, err = f.ModifyAndReturnTTLs(nil, dels, proof)
+					}
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := f.Undo(nil, proof, dels, roots); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

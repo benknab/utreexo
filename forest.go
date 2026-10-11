@@ -1669,6 +1669,11 @@ func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]
 	if err != nil {
 		return nil, err
 	}
+	return f.modifyAndReturnTTLs(adds, delHashes, positions)
+}
+
+// modifyAndReturnTTLs consumes already resolved positions while f.mu is held.
+func (f *Forest) modifyAndReturnTTLs(adds []Leaf, delHashes []Hash, positions []uint64) ([]int32, error) {
 	addIndexes := make([]int32, len(positions))
 	for i, packed := range positions {
 		addIndexes[i] = unpackIndex(packed)
@@ -1678,6 +1683,44 @@ func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]
 		return nil, err
 	}
 	return addIndexes, nil
+}
+
+// ProveAndModify proves the deletions against the current state, then applies
+// one block and returns its proof and deletion add indexes. It resolves each
+// deletion only once and holds the forest lock across proof creation and update.
+//
+// If beforeModify is non-nil, it runs after proving and before any mutation, so
+// callers can store undo data first. An error from it leaves the forest intact.
+// The callback must not mutate the proof or call back into this Forest. Like
+// Modify, a write error during the update can leave partially modified state.
+func (f *Forest) ProveAndModify(adds []Leaf, delHashes []Hash, beforeModify func(Proof) error) (Proof, []int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.recordMode {
+		return Proof{}, nil, fmt.Errorf("cannot call ProveAndModify while in record mode; call HashAll first")
+	}
+	if !f.interiorsCurrent() {
+		return Proof{}, nil, fmt.Errorf("cannot prove over stale parent hashes, run HashAll first")
+	}
+	positions, err := f.lookupDeletions(delHashes)
+	if err != nil {
+		return Proof{}, nil, err
+	}
+	proof, err := f.prove(delHashes, positions)
+	if err != nil {
+		return Proof{}, nil, err
+	}
+	if beforeModify != nil {
+		if err := beforeModify(proof); err != nil {
+			return Proof{}, nil, err
+		}
+	}
+	indexes, err := f.modifyAndReturnTTLs(adds, delHashes, positions)
+	if err != nil {
+		return Proof{}, nil, err
+	}
+	return proof, indexes, nil
 }
 
 // HashAll computes all parent hashes after Record calls are complete.
@@ -1973,7 +2016,11 @@ func (f *Forest) deTwinPairs(targets []targetPair) ([]targetPair, error) {
 func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	return f.prove(delHashes, nil)
+}
 
+// prove reuses packed leaf positions when provided. The caller holds f.mu.
+func (f *Forest) prove(delHashes []Hash, positions []uint64) (Proof, error) {
 	if len(delHashes) == 0 {
 		return Proof{}, nil
 	}
@@ -1983,12 +2030,19 @@ func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
 	targets := make([]uint64, len(delHashes))
 	pairs := make([]targetPair, len(delHashes))
 	for i, hash := range delHashes {
-		packed, found, err := f.positionMap.Get(hash)
-		if err != nil {
-			return Proof{}, fmt.Errorf("positionMap.Get: %w", err)
-		}
-		if !found {
-			return Proof{}, fmt.Errorf("hash %v not found in the position map", hash)
+		var packed uint64
+		if positions != nil {
+			packed = positions[i]
+		} else {
+			var found bool
+			var err error
+			packed, found, err = f.positionMap.Get(hash)
+			if err != nil {
+				return Proof{}, fmt.Errorf("positionMap.Get: %w", err)
+			}
+			if !found {
+				return Proof{}, fmt.Errorf("hash %v not found in the position map", hash)
+			}
 		}
 		leafPos := unpackPos(packed)
 		target, err := f.calculatePositionFromLeaf(hash, leafPos)
