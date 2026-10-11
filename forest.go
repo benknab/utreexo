@@ -1004,14 +1004,7 @@ func (f *Forest) add(hash Hash, addIndex int32) error {
 	return nil
 }
 
-func (f *Forest) deleteSingle(delHash Hash) error {
-	// Get the packed value (contains position + addIndex)
-	packed, _, err := f.positionMap.Get(delHash)
-	if err != nil {
-		return fmt.Errorf("positionMap.Get: %w", err)
-	}
-	leafPos := unpackPos(packed)
-
+func (f *Forest) deleteSingle(delHash Hash, leafPos uint64) error {
 	// Mark position as deleted in the in-memory bitmap.
 	// The WAL will persist dirty bitmap words during flush.
 	f.deletedLeafPositions.set(leafPos)
@@ -1574,25 +1567,37 @@ func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
 		return fmt.Errorf("cannot call Modify while in record mode; call HashAll first")
 	}
 
-	return f.modifyInternal(adds, delHashes)
+	positions, err := f.lookupDeletions(delHashes)
+	if err != nil {
+		return err
+	}
+	return f.modifyInternal(adds, delHashes, positions)
+}
+
+// lookupDeletions resolves the packed position and add index once per deletion.
+// The caller holds f.mu through the subsequent mutation, so these positions
+// remain valid while earlier deletions move hashes up the tree.
+func (f *Forest) lookupDeletions(delHashes []Hash) ([]uint64, error) {
+	// Reject unknown deletions before anything is written: a rejected block
+	// leaves the forest untouched, including its generated-leaves claim.
+	positions := make([]uint64, len(delHashes))
+	for i, delHash := range delHashes {
+		packed, found, err := f.positionMap.Get(delHash)
+		if err != nil {
+			return nil, fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return nil, fmt.Errorf("delhash %v not found in position map", delHash)
+		}
+		positions[i] = packed
+	}
+	return positions, nil
 }
 
 // modifyInternal applies one block, deletions first then additions, and
-// persists the block accounting. The caller holds f.mu and has checked
-// recordMode.
-func (f *Forest) modifyInternal(adds []Leaf, delHashes []Hash) error {
-	// Reject unknown deletions before anything is written: a rejected block
-	// leaves the forest untouched, including its generated-leaves claim.
-	for _, delHash := range delHashes {
-		_, found, err := f.positionMap.Get(delHash)
-		if err != nil {
-			return fmt.Errorf("positionMap.Get: %w", err)
-		}
-		if !found {
-			return fmt.Errorf("delhash %v not found in position map", delHash)
-		}
-	}
-
+// persists the block accounting. The caller holds f.mu, has checked
+// recordMode, and has resolved every deletion with lookupDeletions.
+func (f *Forest) modifyInternal(adds []Leaf, delHashes []Hash, positions []uint64) error {
 	mutating := len(adds) > 0 || len(delHashes) > 0
 
 	// A block is applied by extending the existing parent hashes rather than
@@ -1614,8 +1619,8 @@ func (f *Forest) modifyInternal(adds []Leaf, delHashes []Hash) error {
 	}
 
 	// Delete first.
-	for _, delHash := range delHashes {
-		if err := f.deleteSingle(delHash); err != nil {
+	for i, delHash := range delHashes {
+		if err := f.deleteSingle(delHash, unpackPos(positions[i])); err != nil {
 			// The parent hash writes may have landed partially, so treat them
 			// as unbuilt and let the next rehash pass run from the first leaf.
 			f.lastGeneratedLeaves = 0
@@ -1660,20 +1665,16 @@ func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]
 		return nil, fmt.Errorf("cannot call ModifyAndReturnTTLs while in record mode; call HashAll first")
 	}
 
-	// Collect addIndexes before deletion
-	addIndexes := make([]int32, 0, len(delHashes))
-	for _, delHash := range delHashes {
-		packed, found, err := f.positionMap.Get(delHash)
-		if err != nil {
-			return nil, fmt.Errorf("positionMap.Get: %w", err)
-		}
-		if !found {
-			return nil, fmt.Errorf("missing %v in positionMap. Cannot return ttls", delHash)
-		}
-		addIndexes = append(addIndexes, unpackIndex(packed))
+	positions, err := f.lookupDeletions(delHashes)
+	if err != nil {
+		return nil, err
+	}
+	addIndexes := make([]int32, len(positions))
+	for i, packed := range positions {
+		addIndexes[i] = unpackIndex(packed)
 	}
 
-	if err := f.modifyInternal(adds, delHashes); err != nil {
+	if err := f.modifyInternal(adds, delHashes, positions); err != nil {
 		return nil, err
 	}
 	return addIndexes, nil
@@ -1786,7 +1787,12 @@ func (f *Forest) calculatePosition(hash Hash) (uint64, error) {
 		return 0, fmt.Errorf("hash %v not found in the position map", hash)
 	}
 
-	currentPos := unpackPos(packed)
+	return f.calculatePositionFromLeaf(hash, unpackPos(packed))
+}
+
+// calculatePositionFromLeaf walks from an already resolved leaf position.
+// The caller holds f.mu for reading or writing throughout the lookup and walk.
+func (f *Forest) calculatePositionFromLeaf(hash Hash, currentPos uint64) (uint64, error) {
 	currentHash := hash
 	rowsToTop := 0
 	leftRightIndicator := uint64(0)
@@ -1833,29 +1839,11 @@ type targetPair struct {
 	actualPos uint64 // Position in forest file for reading hashes
 }
 
-// fetchProofHashes fetchses the needed hashes to prove the given delHashes.
-func (f *Forest) fetchProofHashes(delHashes []Hash) ([]Hash, error) {
-	if len(delHashes) == 0 {
+// fetchProofHashes fetches the proof hashes for already resolved targets.
+// It sorts and consumes the caller-owned scratch slice.
+func (f *Forest) fetchProofHashes(targets []targetPair) ([]Hash, error) {
+	if len(targets) == 0 {
 		return nil, nil
-	}
-
-	// Build targets with both calculated and actual positions
-	targets := make([]targetPair, 0, len(delHashes))
-	for _, delHash := range delHashes {
-		packed, found, err := f.positionMap.Get(delHash)
-		if err != nil {
-			return nil, fmt.Errorf("positionMap.Get: %w", err)
-		}
-		if !found {
-			return nil, fmt.Errorf("hash %v not found in the position map", delHash)
-		}
-
-		calcPos, err := f.calculatePosition(delHash)
-		if err != nil {
-			return nil, err
-		}
-
-		targets = append(targets, targetPair{calcPos: calcPos, actualPos: unpackPos(packed)})
 	}
 
 	// Sort by calculated position to match pollard ordering
@@ -1869,7 +1857,14 @@ func (f *Forest) fetchProofHashes(delHashes []Hash) ([]Hash, error) {
 		return nil, err
 	}
 
-	proofHashes := make([]Hash, 0, (len(targets) * int(TreeRows(f.NumLeaves)+1)))
+	// Each row can contribute at most one sibling per target path, and no
+	// more than the number of parents on that row. Accounting for paths
+	// merging near the roots avoids reserving a full-height proof per leaf.
+	proofCapacity := 0
+	for parents := f.NumLeaves / 2; parents > 0; parents /= 2 {
+		proofCapacity += int(min(uint64(len(targets)), parents))
+	}
+	proofHashes := make([]Hash, 0, proofCapacity)
 	for row := uint8(0); row <= f.forestRows; row++ {
 		for i := 0; i < len(targets); i++ {
 			calcPos := targets[i].calcPos
@@ -1986,12 +1981,22 @@ func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
 	// Find target positions using the walk-up algorithm.
 	// calculatePosition returns positions in f.forestRows space.
 	targets := make([]uint64, len(delHashes))
+	pairs := make([]targetPair, len(delHashes))
 	for i, hash := range delHashes {
-		target, err := f.calculatePosition(hash)
+		packed, found, err := f.positionMap.Get(hash)
+		if err != nil {
+			return Proof{}, fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return Proof{}, fmt.Errorf("hash %v not found in the position map", hash)
+		}
+		leafPos := unpackPos(packed)
+		target, err := f.calculatePositionFromLeaf(hash, leafPos)
 		if err != nil {
 			return Proof{}, fmt.Errorf("find target for hash %x: %w", hash[:8], err)
 		}
 		targets[i] = target
+		pairs[i] = targetPair{calcPos: target, actualPos: leafPos}
 	}
 
 	// Translate from f.forestRows space to defaultForestRows space.
@@ -1999,7 +2004,7 @@ func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
 		targets = translatePositions(targets, f.forestRows, defaultForestRows)
 	}
 
-	proofHashes, err := f.fetchProofHashes(delHashes)
+	proofHashes, err := f.fetchProofHashes(pairs)
 	if err != nil {
 		return Proof{}, err
 	}
