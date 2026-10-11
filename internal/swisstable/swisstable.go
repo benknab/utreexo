@@ -128,6 +128,9 @@ func NewSwissPositionMap(ctrlPath, slotsPath string, expectedEntries uint64, con
 			}
 		}
 	}
+	// Keep normal read-ahead for the one-time sequential count above, then
+	// switch to the random accesses used by steady-state hash operations.
+	adviseRandom(ctrlMmap)
 
 	return m, needsRebuild, nil
 }
@@ -232,6 +235,7 @@ func openFiles(ctrlPath, slotsPath string, expectedEntries uint64, consistencyHa
 		slotsFile.Close()
 		return nil, nil, nil, nil, 0, false, fmt.Errorf("mmap slots: %w", err)
 	}
+	adviseRandom(slotsBytes)
 
 	return ctrlFile, slotsFile, ctrlMmap, slotsBytes, numSlots, needsRebuild, nil
 }
@@ -725,6 +729,8 @@ func (m *SwissPositionMap) resize() error {
 	// bytes that would appear as ghost entries to rehashInsert and later
 	// lookups.
 	clear(newCtrl)
+	adviseRandom(newCtrlMmap)
+	adviseRandom(newSlotsMmap)
 
 	// Rehash into the new mmaps WITHOUT updating m's fields. Entries are
 	// iterated in sorted position order so hash reads are sequential. On
