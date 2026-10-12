@@ -10,16 +10,51 @@ import (
 
 type bitmapWriteRecorder struct {
 	*memFile
-	writes int
-	short  bool
+	writes  int
+	short   bool
+	shortAt int
 }
 
 func (r *bitmapWriteRecorder) WriteAt(data []byte, offset int64) (int, error) {
 	r.writes++
-	if r.short {
-		return len(data) - 1, nil
+	if r.short || r.writes == r.shortAt {
+		return r.memFile.WriteAt(data[:len(data)/2], offset)
 	}
 	return r.memFile.WriteAt(data, offset)
+}
+
+func TestBitmapPageWriteRecovery(t *testing.T) {
+	journal := newMemFile()
+	bitmap := &bitmapWriteRecorder{memFile: newMemFile(), shortAt: 2}
+	files := []walFile{
+		{File: newMemFile(), EntrySize: 32},
+		{File: newMemFile(), EntrySize: 4},
+		{File: newMemFile(), EntrySize: 32},
+	}
+	w, err := newWAL(journal, bitmap, files...)
+	require.NoError(t, err)
+	for _, word := range []uint64{0, 17, 511, 512, 777, 1024} {
+		w.Bitmap().set(word*64 + 3)
+	}
+	require.ErrorIs(t, w.Flush([32]byte{7}), io.ErrShortWrite)
+	require.NotEmpty(t, journal.data)
+	w.Close()
+	// Reopen after a partly applied page: the ordinary per-word journal must
+	// recover all intended changes, including words beyond the failed write.
+	recovered, err := newWAL(journal, bitmap.memFile, files...)
+	require.NoError(t, err)
+	defer recovered.Close()
+	for word := uint64(0); word <= 1024; word++ {
+		want := uint64(0)
+		switch word {
+		case 0, 17, 511, 512, 777, 1024:
+			want = 1 << 3
+		}
+		require.Equal(t, want, recovered.Bitmap().bits[word])
+	}
+	require.Len(t, bitmap.data, 1025*8)
+	metadata := files[2].File.(*memFile)
+	require.Equal(t, byte(7), metadata.data[bestHashOffset])
 }
 
 func TestBitmapPageWrites(t *testing.T) {
