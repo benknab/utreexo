@@ -13,7 +13,7 @@ import (
 )
 
 // BenchmarkSwissBatchGet compares identical mmap lookups with one, two and
-// four readers. Cold trials evict only this benchmark's own scratch files.
+// four or eight readers. Cold trials evict only this benchmark's own scratch files.
 // Opt in with UTREEXO_COLD_BENCH=1 and use a small fixed -benchtime (e.g. 3x).
 func BenchmarkSwissBatchGet(b *testing.B) {
 	if os.Getenv("UTREEXO_COLD_BENCH") != "1" {
@@ -77,7 +77,7 @@ func BenchmarkSwissBatchGet(b *testing.B) {
 		}
 	}
 	for _, cold := range []bool{false, true} {
-		for _, workers := range []int{1, 2, 4} {
+		for _, workers := range []int{1, 2, 4, 8} {
 			b.Run(fmt.Sprintf("cold=%t/workers=%d", cold, workers), func(b *testing.B) {
 				b.ReportAllocs()
 				var before, after syscall.Rusage
@@ -88,7 +88,7 @@ func BenchmarkSwissBatchGet(b *testing.B) {
 						evict()
 						b.StartTimer()
 					}
-					var errs [4]error
+					var errs [8]error
 					var wg sync.WaitGroup
 					read := func(worker int) {
 						for i := len(keys) * worker / workers; i < len(keys)*(worker+1)/workers; i++ {

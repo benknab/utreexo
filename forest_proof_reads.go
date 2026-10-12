@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 )
 
-const maxProofReadWorkers = 4
+const maxProofReadWorkers = 8
 
 // readProofRanges overlaps independent mmap misses while the caller holds
 // f.mu. Every worker is joined before returning, including on error, so no

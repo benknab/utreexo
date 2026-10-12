@@ -189,7 +189,7 @@ func TestForestProofReadWorkers(t *testing.T) {
 	f.proofReadWorkers = 1
 	_, wantErr := f.Prove(bad)
 	require.Error(t, wantErr)
-	for _, workers := range []int{1, 2, 4} {
+	for _, workers := range []int{1, 2, 4, 8} {
 		f.proofReadWorkers = workers
 		got, err := f.Prove(dels)
 		require.NoError(t, err)
@@ -217,16 +217,16 @@ func TestForestProofReadWorkers(t *testing.T) {
 }
 
 func TestProofReadFailureJoinsWorkers(t *testing.T) {
-	f := &Forest{proofReadWorkers: 4}
+	f := &Forest{proofReadWorkers: 8}
 	started, release := make(chan struct{}), make(chan struct{})
 	done := make(chan error, 1)
 	firstErr, laterErr := errors.New("first range"), errors.New("later range")
 	go func() {
-		done <- f.readProofRanges(512, func(start, end int) error {
+		done <- f.readProofRanges(1024, func(start, end int) error {
 			switch start {
 			case 0:
 				return firstErr
-			case 384:
+			case 896:
 				close(started)
 				<-release
 				return laterErr

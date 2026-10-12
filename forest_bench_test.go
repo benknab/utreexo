@@ -65,7 +65,7 @@ func BenchmarkForestProve(b *testing.B) {
 
 func BenchmarkForestProofReaders(b *testing.B) {
 	f, live := benchmarkProofForest(b)
-	for _, workers := range []int{1, 2, 4} {
+	for _, workers := range []int{1, 2, 4, 8} {
 		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
 			f.proofReadWorkers = workers
 			b.ReportAllocs()
