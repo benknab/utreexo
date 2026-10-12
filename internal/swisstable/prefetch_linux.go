@@ -14,7 +14,9 @@ var prefetchSink atomic.Uint64
 // caller must exclude mutations until this method returns. All readers join
 // before return; a later resize merely makes the hints ineffective.
 func (m *SwissPositionMap) Prefetch(n int, hashAt func(int) [32]byte) {
-	workers := min(4, runtime.GOMAXPROCS(0))
+	// These independent hint reads are dominated by cold page latency. Keep
+	// their bound separate from proof readers, which also do shared-cache work.
+	workers := min(8, runtime.GOMAXPROCS(0))
 	if n < 512 || workers < 2 {
 		return
 	}
