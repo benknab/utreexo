@@ -2,6 +2,8 @@ package utreexo
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -35,6 +37,46 @@ func BenchmarkWALFlush(b *testing.B) {
 					if err := w.Cached(0).PutHashAt(Hash{1}, int64(j*32)); err != nil {
 						b.Fatal(err)
 					}
+				}
+				b.StartTimer()
+				if err := w.Flush([32]byte{1}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// Include journal encoding, bitmap application and every durability barrier.
+// All files belong to this fixture; the live node's cache is never evicted.
+func BenchmarkWALBitmapFlush(b *testing.B) {
+	for _, stride := range []uint64{1, 17, 1024} {
+		b.Run(fmt.Sprint(stride), func(b *testing.B) {
+			dir := b.TempDir()
+			files := make([]*os.File, 5)
+			for i := range files {
+				f, err := os.Create(filepath.Join(dir, fmt.Sprint(i)))
+				if err != nil {
+					b.Fatal(err)
+				}
+				files[i] = f
+				b.Cleanup(func() { f.Close() })
+			}
+			w, err := newWAL(files[0], rawFile{files[1]},
+				walFile{File: rawFile{files[2]}, EntrySize: 32},
+				walFile{File: rawFile{files[3]}, EntrySize: 4},
+				walFile{File: rawFile{files[4]}, EntrySize: 32})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(w.Close)
+			const count = 100000
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				for i := uint64(0); i < count; i++ {
+					w.Bitmap().set(i * stride * 64)
 				}
 				b.StartTimer()
 				if err := w.Flush([32]byte{1}); err != nil {

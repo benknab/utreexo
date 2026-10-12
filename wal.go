@@ -312,19 +312,8 @@ func (w *wal) applyFromCaches(bestHash [32]byte) error {
 		}
 	}
 
-	// Apply dirty bitmap words to the underlying bitmap file.
-	var bitmapErr error
-	w.bitmap.forEachDirty(func(offset int64, data []byte) {
-		if bitmapErr != nil {
-			return
-		}
-		if _, err := w.bitmapFile.WriteAt(data, offset); err != nil {
-			bitmapErr = fmt.Errorf("bitmap file write at %d: %w", offset, err)
-			return
-		}
-	})
-	if bitmapErr != nil {
-		return bitmapErr
+	if err := w.bitmap.writeDirty(w.bitmapFile); err != nil {
+		return err
 	}
 
 	// Write bestHash to metaFile at bestHashOffset.

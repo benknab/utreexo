@@ -167,15 +167,16 @@ func (b *deletedBitmap) unset(pos uint64) {
 }
 
 // forEachDirty calls fn for each dirty bitmap word, providing the byte offset
-// in the file and the 8-byte little-endian encoded word.
+// in the file and the 8-byte little-endian encoded word. The callback must
+// consume or copy data before returning; the serialization buffer is reused.
 func (b *deletedBitmap) forEachDirty(fn func(offset int64, data []byte)) {
+	var buf [8]byte
 	for wordIdx := range b.dirtyWords {
 		// This should never happen in practice since dirtyWords are only
 		// added by set/unset which ensure the index is within bounds.
 		if wordIdx >= uint64(len(b.bits)) {
 			continue
 		}
-		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], b.bits[wordIdx])
 		fn(int64(wordIdx)*8, buf[:])
 	}
